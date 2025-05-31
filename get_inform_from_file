@@ -1,0 +1,173 @@
+from collections import Counter
+
+import pandas as pd
+from sqlalchemy import create_engine
+
+import config
+from dictionary_rayons import streets_dict
+from get_coord import coords_main
+
+
+def check_condition(value):
+    try:
+        numbers = str(value).split('/')[0:2]
+        first_num = int(numbers[0].strip())
+        second_num = int(numbers[1].split(',')[0].strip())
+        if first_num == second_num or first_num == 1:
+            return 1
+        else:
+            return 0
+    except (IndexError, ValueError):
+        return 0
+
+
+def determine_bathroom_type(sanuzel):
+    sanuzel = str(sanuzel).lower()
+
+    has_combined = 'совмещенный' in sanuzel
+    has_separate = 'раздельный' in sanuzel
+
+    if has_combined and has_separate:
+        return 'err'
+    elif has_combined:
+        return 1
+    elif has_separate:
+        return 0
+    else:
+        return 1
+
+
+def determine_repair_type(repair):
+    repair = str(repair).lower()
+
+    cosmetos = 'косметический' in repair
+    euro = 'евроремонт' in repair
+    design = 'дизайнерский' in repair
+
+    if cosmetos:
+        return 1, 0, 0  # Косметический
+    elif euro:
+        return 0, 1, 0  # Евроремонт
+    elif design:
+        return 0, 0, 1  # Дизайнерский
+    else:
+        return 0, 0, 0  # Без ремонта
+
+
+def create_appliance_columns(row):
+    appliances = ["Кондиционер", "Холодильник", "Посудомоечная машина", "Стиральная машина",
+                  "Мебель в комнатах", "Мебель на кухне", "Интернет", "Телефон", "Телевизор", "Душевая кабина"]
+    result = {}
+    row_str = str(row)
+    for appliance in appliances:
+        result[appliance] = 1 if appliance in row_str else 0
+    return result
+
+
+def extract_and_replace_district(address):
+    districts_lower = {key.lower(): [street.lower() for street in streets] for key, streets in streets_dict.items()}
+    street_counter = Counter(street for streets in streets_dict.values() for street in streets)
+    # Извлечение текста между второй и третьей запятой
+    try:
+        street_part = address.split(",")[2].strip().lower()
+    except IndexError:
+        return "err"  # Возврат исходного адреса, если формат не подходит
+
+    # Удаление всего до первого пробела
+    street_name = street_part.split(" ", 1)[-1]
+
+    if street_counter.get(street_name.capitalize(), 0) > 1:
+        return address
+
+    # Поиск района по улице
+    for district, streets in districts_lower.items():
+        if street_name in streets:
+            return district.capitalize()
+
+    return address  # Возврат исходного адреса, если район не найден
+
+
+def get_inform_from_file(file):
+    df = pd.read_excel(file)
+    selected_columns = ['Количество комнат', 'Адрес', 'Площадь, м2', 'Дом', 'Цена',
+                        'Ремонт', 'Балкон', 'Санузел', 'Дополнительно', 'Ссылка на объявление']
+    selected_df = df[selected_columns]
+
+    selected_df.loc[:, "Количество комнат"] = selected_df["Количество комнат"].astype(str).str.extract(r'(\d)',
+                                                                                                       expand=False).astype(
+        'Int64')
+    selected_df.loc[:, "Площадь, м2"] = selected_df["Площадь, м2"].str.extract(r'(\d+[.,]?\d*)', expand=False)
+    selected_df.loc[:, "Цена"] = selected_df["Цена"].apply(lambda x: str(x).split('руб.')[0].strip())
+    selected_df.loc[:, "Балкон"] = selected_df["Балкон"].apply(lambda x: 1 if 'Балкон' in str(x) else 0)
+    selected_df.loc[:, "Дом"] = selected_df["Дом"].apply(check_condition)
+
+    selected_df.loc[:, "Район"] = selected_df["Адрес"].apply(extract_and_replace_district)
+    selected_df = selected_df.assign(metro_distance=0, center_distance=0)
+
+    selected_df.loc[:, 'Санузел'] = selected_df['Санузел'].apply(determine_bathroom_type)
+    selected_df = selected_df.loc[selected_df['Санузел'] != 'err']
+
+    selected_df[['Косметический', 'Евроремонт', 'Дизайнерский']] = (
+        selected_df['Ремонт'].apply(determine_repair_type).apply(pd.Series)
+    )
+    appliance_columns = selected_df['Дополнительно'].apply(create_appliance_columns).apply(pd.Series)
+    selected_df = pd.concat([selected_df, appliance_columns], axis=1)
+
+    columns_to_drop_after_check = ['Ремонт', 'Дополнительно']
+    selected_df = selected_df.drop(columns=columns_to_drop_after_check)
+    return selected_df
+
+
+if __name__ == '__main__':
+    new_df = get_inform_from_file("offers_02_05_2025_2k.xlsx")
+    new_df["createddatetime"] = pd.Timestamp.now()
+    # Изменение названий и порядка столбцов
+    new_df = new_df.rename(columns={
+        "Количество комнат": "countofrooms",
+        "Адрес": "address",
+        "Район": "rayon",
+        "Площадь, м2": "square",
+        "Дом": "istopfloor",
+        "Цена": "price",
+        "Балкон": "havebalcony",
+        "Ссылка на объявление": "urlapartment",
+        "Санузел": "iscombinedbathroom",
+        "Косметический": "iscosmeticrepair",
+        "Евроремонт": "iseurorepair",
+        "Дизайнерский": "isdesignerrepair",
+        "Кондиционер": "haveconditioner",
+        "Холодильник": "havefridge",
+        "Посудомоечная машина": "havedishwasher",
+        "Стиральная машина": "havewashingmashine",
+        "Мебель в комнатах": "haveroomfurniture",
+        "Мебель на кухне": "havekitchenfurniture",
+        "Интернет": "haveinternet",
+        "Телефон": "havephone",
+        "Телевизор": "havetv",
+        "Душевая кабина": "haveshowercabin",
+        "metro_distance": "metro_distance",
+        "center_distance": "center_distance"
+    })
+    column_order = ["urlapartment", "countofrooms", "address", "rayon", "square", "price", "metro_distance",
+                    "center_distance",
+                    "havebalcony", "istopfloor",
+                    "iscombinedbathroom", "iscosmeticrepair", "iseurorepair",
+                    "isdesignerrepair", "haveconditioner", "havefridge", "havedishwasher", "havewashingmashine",
+                    "haveroomfurniture", "havekitchenfurniture", "haveinternet", "havephone", "havetv",
+                    "haveshowercabin", "createddatetime"]
+    new_df = new_df[column_order]
+
+    db_url = f"postgresql://{config.db_settings['user']}:{config.db_settings['password']}@{config.db_settings['host']}:{config.db_settings['port']}/{config.db_settings['dbname']}"
+    engine = create_engine(db_url)
+
+    existing_urls = pd.read_sql("SELECT urlapartment FROM apartment", engine)["urlapartment"]
+
+    new_df = new_df[~new_df["urlapartment"].isin(existing_urls)]
+    print(f"Количество оставшихся записей {len(new_df)}")
+    new_df[["metro_distance", "center_distance"]] = new_df["address"].apply(lambda x: pd.Series(coords_main(x)))
+
+    if not new_df.empty:
+        new_df.to_sql("apartment", engine, if_exists="append", index=False)
+        print(f"Добавлено {len(new_df)} новых записей в БД")
+    else:
+        print("Нет новых записей для добавления")
